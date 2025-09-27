@@ -1,0 +1,4 @@
+- Kinda works
+- Made for Love 12
+- Tested on Fedora
+- Press enter to go
