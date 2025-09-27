@@ -3,6 +3,18 @@ local https = require "https"
 local lovely = {} -- callbacks
 local gui = {} -- browser gui (quick & dirty)
 local cache = {} -- currently loaded games
+local settings = {
+	window_mode = "auto", --[[
+		auto: lovely window determined by embedded app
+		stretch: embedded app stretched to fill lovely window (todo: implement)
+		fill: embedded app zoomed to fit lovely window with letterboxing (todo: implement)
+		pixel-perfect: embedded app keeps its set resolution (todo: implement)
+	]]
+	private_saves = true, --[[
+		use lovely-specific save directory, or save in app's own directory
+
+	]]
+}
 
 gui.navbar = {
 	w = 4,
@@ -24,18 +36,24 @@ end
 
 local function load_app(path)
 	local app = {
-		path = path,
+		 -- these fallback to .love filename, otherwise set by conf later
 		slug = path:match("([^.]+)"),
-		title = path:match("([^.]+)"), -- fallback to .love filename, but this'll get overwritten later if a title is later provided by the app itself
+		title = path:match("([^.]+)"),
+		identity = path:match("([^.]+)"),
+
+		path = path,
 		env = {},
 		callbacks = {},
 		loaded_modules = {
 			-- love builtins
 			socket = require "socket",
 			https = require "https",
-			ffi = require "ffi"
+			ffi = require "ffi",
+			enet = require "enet",
+			utf8 = require "utf8"
 		},
-		is_active = true
+		is_active = true,
+		window = {}
 	}
 
 	setmetatable(app.env, {__index = _G}) -- give access to real globals, hmm
@@ -62,15 +80,37 @@ local function load_app(path)
 
 	app.env.love = setmetatable({}, {
 		__index = function(t, k)
-			if k == "filesystem" then
-				return setmetatable({}, {
-					__index = function(t2, k2)
-						return love.filesystem[k2]
-						-- todo: custom filesystem functions that keeps everything in app subdirectory inside lovely
-
+		if k == "filesystem" then
+			return setmetatable({}, {
+				__index = function(t2, k2)
+					-- keep identity contained to app
+					if k2 == "setIdentity" then
+						return function(identity)
+							app.identity = identity
+						end
 					end
-				})
-			end
+
+					-- ensure app has the right identity for saves
+					local identity_prefix = settings.private_saves and "lovely-browser/" or ""
+					love.filesystem.setIdentity(identity_prefix .. app.identity)
+
+					return function (...)
+						local out = love.filesystem[k2](...)
+						love.filesystem.setIdentity("lovely-browser")
+						return out
+					end
+				end
+			})
+		elseif k == "window" then
+			return setmetatable({}, {
+				__index = function(t2, k2)
+					-- todo: other window modes
+					if settings.window_mode == "auto" then
+						return love.window[k2]
+					end
+				end
+			})
+		end
 			return love[k]
 		end,
 		__newindex = function(t, k, v)
@@ -85,7 +125,7 @@ local function load_app(path)
 	-- and mounting an archive with a conf.lua of its own overwrites the default love.conf
 	-- and even when you unmount the archive, the overwritten conf.lua sticks around
 	-- or something like that
-	-- there go three hours of my sanity
+	-- don't ask me to explain it
 	-- (and for the record mounting at root is necessary for running conf and main)
 	love.filesystem.mount(app.path, app.slug)
 	local main = love.filesystem.load(app.slug .. "/main.lua")
@@ -93,23 +133,42 @@ local function load_app(path)
 	love.filesystem.unmount(app.path)
 	love.filesystem.mount(app.path, "")
 
-
-	local conf_table = {
+	-- all this conf stuff is pretty messy, needs redoing but it works for now
+	-- maybe just have a default conf table and pass that to the love.conf callback?
+	-- load conf
+	local conf_data = {
 		window = {},
 		audio = {},
 		modules = {}
 	}
 	if conf then
 		setfenv(conf, app.env)
-		-- run the conf.lua
+		-- execute the conf.lua
 		conf()
-		-- conf.lua works by defining love.conf, so make sure to run that too
+		-- conf.lua works by defining love.conf function, so make sure to run the actual function
 		if app.callbacks.conf then
-			app.callbacks.conf(conf_table)
+			app.callbacks.conf(conf_data)
 		end
 	end
-	-- todo: fully reset
-	love.window.setMode(conf_table.window.width or 800, conf_table.window.height or 600)
+
+	-- set app settings from conf_data
+	app.identity = conf_data.identity or app.slug
+	app.title = conf_data.window.title or app.title
+	app.icon = conf_data.window.icon
+
+	app.window.resizeable = conf_data.window.resizable or false
+	app.window.minwidth = conf_data.window.minwidth or 1
+	app.window.minheight = conf_data.window.minheight or 1
+	app.window.fullscreen = conf_data.window.fullscreen or false
+	app.window.fullscreentype = conf_data.window.fullscreentype or "desktop"
+	app.window.vsync = conf_data.window.vsync or 1
+	app.window.width = conf_data.window.width or 800
+	app.window.height = conf_data.window.height or 600
+	-- todo: fully reset graphics state
+	if settings.window_mode == "auto" then
+		-- why does passing app.window as third argument cause a crash?
+		love.window.setMode(app.window.width, app.window.height, app.window)
+	end
 
 	setfenv(main, app.env)
 	main()
@@ -149,8 +208,8 @@ end
 
 function lovely.draw()
 	-- works for isolating lovely drawing, but doesn't fully encapsulate app graphical state
-	-- won't work with multiple tabs or whatever
-	-- todo: think of a nice way to cache app graphics state
+	-- might cause issues with multiple tabs or whatever
+	-- todo: think of a nice way to cache app graphics states
 	love.graphics.push("all")
 	love.graphics.reset()
 	if gui.navbar.is_expanded then
@@ -249,6 +308,7 @@ for _,callback in ipairs(love_callbacks) do
 					love.filesystem.mount(app.path, "")
 
 					-- Use a protected call to ensure unmount happens even if the app errors.
+
 					local success = pcall(app.callbacks[callback], ...)
 					love.filesystem.unmount(app.path)
 				end
